@@ -97,6 +97,10 @@ pub struct CompactMacBus<TRenderer: Renderer> {
     /// VPA/E-clock sync in progress
     vpa_sync: bool,
 
+    /// born-32: the E clock wrapped (low edge) since the current VPA sync began
+    #[serde(skip)]
+    eclock_edge: bool,
+
     /// Programmer's key pressed
     progkey_pressed: LatchingEvent,
 
@@ -202,6 +206,7 @@ where
             last_audiosample: 0,
             vblank_time: Instant::now(),
             vpa_sync: false,
+            eclock_edge: false,
             progkey_pressed: LatchingEvent::default(),
             mouse_mode,
             plusmouse_rel_x: 0,
@@ -637,8 +642,11 @@ where
             if !self.vpa_sync {
                 // Start E-Clock synchronization, wait for next low edge.
                 self.vpa_sync = true;
-            } else if self.eclock == 0 {
-                // Low edge, synchronized
+                self.eclock_edge = false;
+            } else if self.eclock == 0 || (self.model == MacModel::HugeSE && self.eclock_edge) {
+                // Low edge, synchronized.  born-32: the 030 retries every 2 cycles, so an
+                // access that starts on an odd E-clock phase samples 1,3,5,7,9 forever and
+                // never sees 0 (the emulator livelocks inside one bus read) -- latch the wrap.
                 self.vpa_sync = false;
                 return false;
             }
@@ -837,6 +845,7 @@ where
                 // The E Clock is roughly 1/10th of the CPU clock
                 // TODO ticks when VPA is asserted
                 self.eclock -= 10;
+                self.eclock_edge = true;
 
                 self.via.tick(1, ctx)?;
             }
