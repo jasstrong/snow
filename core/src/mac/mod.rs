@@ -68,6 +68,11 @@ pub enum MacModel {
     MacIIcx,
     /// Macintosh SE/30
     SE30,
+    /// Born-32 Macintosh SE ("hugeSE"): SE peripherals under a 68030 + PMMU, 16MB of
+    /// flat RAM, the ROM at $40800000 and the SE I/O relocated by +$40000000. Mirrors
+    /// the PiStorm hugeSE machine. Keep it last: the compact bus relies on `>= SE` /
+    /// `<= Plus` ordering, and appending leaves existing serialized indices alone.
+    HugeSE,
 }
 
 #[allow(clippy::match_like_matches_macro)]
@@ -126,6 +131,7 @@ impl MacModel {
             | Self::MacIIx
             | Self::MacIIcx
             | Self::SE30 => 8 * 1024 * 1024,
+            Self::HugeSE => 16 * 1024 * 1024,
         }
     }
 
@@ -183,6 +189,8 @@ impl MacModel {
                     128 * 1024 * 1024,
                 ]
             }
+            // The born-32 ROM's memory layout (boot32.h) is built for 16MB
+            Self::HugeSE => &[16 * 1024 * 1024],
         }
     }
 
@@ -193,6 +201,7 @@ impl MacModel {
             Self::SeFdhd | Self::Classic | Self::Portable | Self::Portable15MB => true,
             Self::MacII => false,
             Self::MacIIFDHD | Self::MacIIx | Self::MacIIcx | Self::SE30 => true,
+            Self::HugeSE => false,
         }
     }
 
@@ -201,7 +210,7 @@ impl MacModel {
         match self {
             Self::Early128K | Self::Early512K => &[DriveType::GCR400K, DriveType::GCR400K],
             Self::Early512Ke | Self::Plus => &[DriveType::GCR800K, DriveType::GCR800K],
-            Self::SE => &[DriveType::GCR800K, DriveType::GCR800K, DriveType::GCR800K],
+            Self::SE | Self::HugeSE => &[DriveType::GCR800K, DriveType::GCR800K, DriveType::GCR800K],
             Self::SeFdhd => &[
                 DriveType::SuperDrive,
                 DriveType::SuperDrive,
@@ -261,6 +270,8 @@ impl MacModel {
             | Self::MacIIx
             | Self::MacIIcx
             | Self::SE30 => Some((0x000CFC, 0x574C5343)),
+            // born-32: never poke guest RAM behind the ROM's back (keeps traces clean)
+            Self::HugeSE => None,
         }
     }
 
@@ -276,7 +287,7 @@ impl MacModel {
             | Self::Portable
             | Self::Portable15MB => M68000,
             Self::MacII | Self::MacIIFDHD => M68020,
-            Self::MacIIx | Self::MacIIcx | Self::SE30 => M68030,
+            Self::MacIIx | Self::MacIIcx | Self::SE30 | Self::HugeSE => M68030,
         }
     }
 
@@ -289,7 +300,8 @@ impl MacModel {
             | Self::SE
             | Self::SeFdhd
             | Self::Portable
-            | Self::Portable15MB => via::RegisterA(0xFF),
+            | Self::Portable15MB
+            | Self::HugeSE => via::RegisterA(0xFF),
             Self::Classic => {
                 // Mac Classic has a pulldown (R79) as model identifier
                 via::RegisterA(0xFF).with_sndpg2(false)
@@ -320,7 +332,8 @@ impl MacModel {
             | Self::SeFdhd
             | Self::Portable
             | Self::Portable15MB
-            | Self::Classic => panic!("Invalid operation for this model"),
+            | Self::Classic
+            | Self::HugeSE => panic!("Invalid operation for this model"),
             Self::MacII | Self::MacIIFDHD | Self::MacIIcx => macii::via2::RegisterB(0xFF),
             Self::MacIIx | Self::SE30 => macii::via2::RegisterB(0x87),
         }
@@ -345,6 +358,7 @@ impl MacModel {
             .iter()
             .find(|(h, _)| h == &digest)
             .map(|(_, models)| models[0])
+            .or_else(|| Self::is_born32_rom(rom).then_some(Self::HugeSE))
     }
 
     /// Checks whether the provided ROM is valid for this model
@@ -354,6 +368,14 @@ impl MacModel {
         Self::ROMS
             .iter()
             .any(|(h, models)| h == &digest && models.contains(self))
+            || (*self == Self::HugeSE && Self::is_born32_rom(rom))
+    }
+
+    /// Recognizes a born-32 (hugeSE) ROM by shape rather than digest, since it is
+    /// rebuilt often: 512KB with the reset PC at $4080002A (a stock SE ROM resets
+    /// to $0040002A).
+    fn is_born32_rom(rom: &[u8]) -> bool {
+        rom.len() == 0x8_0000 && rom.get(4..8) == Some(&[0x40, 0x80, 0x00, 0x2A][..])
     }
 }
 
@@ -377,6 +399,7 @@ impl Display for MacModel {
                 Self::MacIIx => "Macintosh IIx",
                 Self::MacIIcx => "Macintosh IIcx",
                 Self::SE30 => "Macintosh SE/30",
+                Self::HugeSE => "Macintosh SE (born-32 hugeSE)",
             }
         )
     }

@@ -109,6 +109,7 @@ macro_rules! dispatch {
                         Self::MacII(inner) => &inner.$($ref_target)*,
                         Self::MacIIPmmu(inner) => &inner.$($ref_target)*,
                         Self::MacII30(inner) => &inner.$($ref_target)*,
+                        Self::HugeSE(inner) => &inner.$($ref_target)*,
                     }
                 }
             )*
@@ -122,6 +123,7 @@ macro_rules! dispatch {
                         Self::MacII(inner) => &mut inner.$($mut_ref_target)*,
                         Self::MacIIPmmu(inner) => &mut inner.$($mut_ref_target)*,
                         Self::MacII30(inner) => &mut inner.$($mut_ref_target)*,
+                        Self::HugeSE(inner) => &mut inner.$($mut_ref_target)*,
                     }
                 }
             )*
@@ -135,6 +137,7 @@ macro_rules! dispatch {
                         Self::MacII(inner) => inner.$($immut_call_target)*,
                         Self::MacIIPmmu(inner) => inner.$($immut_call_target)*,
                         Self::MacII30(inner) => inner.$($immut_call_target)*,
+                        Self::HugeSE(inner) => inner.$($immut_call_target)*,
                     }
                 }
             )*
@@ -148,6 +151,7 @@ macro_rules! dispatch {
                         Self::MacII(inner) => inner.$($mut_call_target)*,
                         Self::MacIIPmmu(inner) => inner.$($mut_call_target)*,
                         Self::MacII30(inner) => inner.$($mut_call_target)*,
+                        Self::HugeSE(inner) => inner.$($mut_call_target)*,
                     }
                 }
             )*
@@ -169,6 +173,8 @@ enum EmulatorConfig {
     MacIIPmmu(Box<CpuM68020Pmmu<MacIIBus<ChannelRenderer, false>>>),
     /// Macintosh SE/30 and 68030-based Macintosh IIs
     MacII30(Box<CpuM68030Fpu<MacIIBus<ChannelRenderer, false>>>),
+    /// Born-32 Macintosh SE (hugeSE): the compact SE bus under a 68030 + PMMU
+    HugeSE(Box<CpuM68030Fpu<CompactMacBus<ChannelRenderer>>>),
 }
 
 dispatch! {
@@ -479,6 +485,54 @@ impl Emulator {
                 assert_eq!(cpu.get_type(), model.cpu_type());
 
                 EmulatorConfig::MacII30(cpu)
+            }
+            MacModel::HugeSE => {
+                // born-32 hugeSE: the stock SE compact bus (born-32 decode is keyed off
+                // the model) under a 68030 + PMMU. The ROM builds its own page tables.
+                let extension_rom = extra_roms.iter().find_map(|p| match p {
+                    ExtraROMs::ExtensionROM(data) => Some(*data),
+                    _ => None,
+                });
+                let bus = CompactMacBus::new(
+                    model,
+                    rom,
+                    extension_rom,
+                    renderer,
+                    mouse_mode,
+                    ram_size,
+                    override_fdd_type,
+                );
+                let mut cpu = Box::new(CpuM68030Fpu::new(bus));
+                assert_eq!(cpu.get_type(), model.cpu_type());
+                cpu.born32 = true;
+                // Debug: SNOW_B32_PCTRAP=lo:hi (hex) stops the first time the PC enters [lo, hi)
+                cpu.pc_trap = std::env::var("SNOW_B32_PCTRAP").ok().and_then(|s| {
+                    let (lo, hi) = s.split_once(':')?;
+                    let hex = |v: &str| Address::from_str_radix(v.trim_start_matches("0x"), 16).ok();
+                    Some((hex(lo)?, hex(hi)?))
+                });
+                if let Some((lo, hi)) = cpu.pc_trap {
+                    log::info!("born-32 PC trap armed: [${lo:08X}, ${hi:08X})");
+                }
+                // Debug: SNOW_B32_WATCH=lo:hi (hex) logs every CPU write into [lo, hi)
+                cpu.write_watch = std::env::var("SNOW_B32_WATCH").ok().and_then(|s| {
+                    let (lo, hi) = s.split_once(':')?;
+                    let hex = |v: &str| Address::from_str_radix(v.trim_start_matches("0x"), 16).ok();
+                    Some((hex(lo)?, hex(hi)?))
+                });
+                if let Some((lo, hi)) = cpu.write_watch {
+                    log::info!("born-32 write watch armed: [${lo:08X}, ${hi:08X})");
+                }
+                // Debug: SNOW_B32_WATCH_STOP=N stops (breakpoint latch) at the Nth watched byte write
+                cpu.write_watch_stop = std::env::var("SNOW_B32_WATCH_STOP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if cpu.write_watch_stop != 0 {
+                    log::info!("born-32 write watch: stop at watched write #{}", cpu.write_watch_stop);
+                }
+
+                EmulatorConfig::HugeSE(cpu)
             }
         };
 
@@ -1322,8 +1376,10 @@ impl Tickable for Emulator {
                         }
                     }
                     EmulatorCommand::SetDebugFramebuffers(v) => {
-                        if let EmulatorConfig::Compact(c) = &mut self.config {
-                            c.bus.video.debug_framebuffers = v;
+                        match &mut self.config {
+                            EmulatorConfig::Compact(c) => c.bus.video.debug_framebuffers = v,
+                            EmulatorConfig::HugeSE(c) => c.bus.video.debug_framebuffers = v,
+                            _ => (),
                         }
                     }
                     EmulatorCommand::SetFloppyRpmAdjustment(drive, adjustment) => {

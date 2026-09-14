@@ -136,6 +136,11 @@ where
     /// CrsrNew address
     const ADDR_CRSRNEW: Address = 0x08CE;
 
+    /// born-32 (hugeSE): base of the SE I/O window; SE bus address = phys - this
+    const B32_IOMAP_BASE: Address = 0x4000_0000;
+    /// born-32 (hugeSE): ROM base address
+    const B32_ROM_BASE: Address = 0x4080_0000;
+
     pub fn new(
         model: MacModel,
         rom: &[u8],
@@ -430,6 +435,97 @@ where
         }
     }
 
+    /// born-32 (hugeSE) read decode: 16MB of flat RAM, the ROM at $40800000 and the
+    /// SE I/O at SE address + $40000000 (PiStorm's iomap window). While the reset
+    /// overlay is on the ROM also appears at $0-$1FFFF; the first access to the ROM
+    /// region turns the overlay off.
+    fn read_born32(&mut self, addr: Address) -> Option<Byte> {
+        match addr {
+            0x0000_0000..=0x0001_FFFF if self.overlay => Some(
+                *self
+                    .rom
+                    .get(addr as usize & self.rom_mask)
+                    .unwrap_or(&self.openbus[(addr & 1) as usize]),
+            ),
+            0x0000_0000..=0x00FF_FFFF => Some(self.ram[addr as usize & self.ram_mask]),
+            0x4080_0000..=0x408F_FFFF => {
+                self.overlay = false;
+                Some(
+                    *self
+                        .rom
+                        .get((addr - Self::B32_ROM_BASE) as usize)
+                        .unwrap_or(&self.openbus[(addr & 1) as usize]),
+                )
+            }
+            0x4000_0000..=0x40FF_FFFF => self.read_se_io(addr - Self::B32_IOMAP_BASE),
+            _ => None,
+        }
+    }
+
+    /// born-32 (hugeSE) write decode; see `read_born32`.
+    fn write_born32(&mut self, addr: Address, val: Byte) -> Option<()> {
+        match addr {
+            0x0000_0000..=0x00FF_FFFF => {
+                let idx = addr as usize & self.ram_mask;
+                let a = idx as Address;
+                // Duplicate framebuffers to video component (writes also go through RAM)
+                if self.fb_main.contains(&a) {
+                    self.video.framebuffers[0][(a - self.fb_main.start) as usize] = val;
+                }
+                if self.fb_alt.contains(&a) {
+                    self.video.framebuffers[1][(a - self.fb_alt.start) as usize] = val;
+                }
+                self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
+                Some(self.ram[idx] = val)
+            }
+            // ROM is read-only (on PiStorm these fall through to a harmless SE bus cycle)
+            0x4080_0000..=0x408F_FFFF => {
+                self.overlay = false;
+                Some(())
+            }
+            0x4000_0000..=0x40FF_FFFF => self.write_se_io(addr - Self::B32_IOMAP_BASE, val),
+            _ => None,
+        }
+    }
+
+    /// SE I/O read by SE bus address (the born-32 $40 window)
+    fn read_se_io(&mut self, se: Address) -> Option<Byte> {
+        match se {
+            // SCSI
+            0x0058_0000..=0x005F_FFFF => self.scsi.read(se),
+            // Phase adjust (ignore)
+            0x009F_FFF7 | 0x009F_FFF9 => Some(0),
+            // SCC
+            0x009F_0000..=0x009F_FFFF | 0x00BF_0000..=0x00BF_FFFF => self.scc.read(se >> 1),
+            // IWM
+            0x00DF_E1FF..=0x00DF_FFFF => self.swim.read(se),
+            // VIA
+            0x00EF_0000..=0x00EF_FFFF => self.via.read(se),
+            // Phase read (ignore)
+            0x00F0_0000..=0x00F7_FFFF => Some(0),
+            _ => None,
+        }
+    }
+
+    /// SE I/O write by SE bus address (the born-32 $40 window)
+    fn write_se_io(&mut self, se: Address, val: Byte) -> Option<()> {
+        match se {
+            // SCSI
+            0x0058_0000..=0x005F_FFFF => self.scsi.write(se, val),
+            // SCC
+            0x009F_0000..=0x009F_FFFF | 0x00BF_0000..=0x00BF_FFFF => self.scc.write(se >> 1, val),
+            // IWM
+            0x00DF_E1FF..=0x00DF_FFFF => self.swim.write(se, val),
+            // VIA
+            0x00EF_0000..=0x00EF_FFFF => {
+                self.via.write(se, val);
+
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
     /// Updates the mouse position (relative coordinates) and button state
     pub fn mouse_update_rel(&mut self, relx: i16, rely: i16, button: Option<bool>) {
         if self.mouse_mode == MouseMode::Disabled {
@@ -519,18 +615,25 @@ where
 
     /// Tests for wait states on bus access
     fn in_waitstate(&mut self, addr: Address) -> bool {
-        // DTACK (only for RAM region)
-        if (0x0000_0000..=0x003F_FFFF).contains(&addr)
-            && !self.video.in_blanking_period()
-            && !self.model.ram_interleave_cpu(self.cycles)
-        {
-            // RAM access for CPU currently blocked by memory controller
-            // https://www.bigmessowires.com/2011/08/25/68000-interleaved-memory-controller-design/
-            return true;
-        }
+        let vpa = if self.model == MacModel::HugeSE {
+            // born-32: RAM and ROM belong to the 030 (no video interleave); only the
+            // VIA (SE bus $E00000 and up, through the $40 I/O window) syncs to the E clock.
+            (0x40E0_0000..=0x40FF_FFFF).contains(&addr)
+        } else {
+            // DTACK (only for RAM region)
+            if (0x0000_0000..=0x003F_FFFF).contains(&addr)
+                && !self.video.in_blanking_period()
+                && !self.model.ram_interleave_cpu(self.cycles)
+            {
+                // RAM access for CPU currently blocked by memory controller
+                // https://www.bigmessowires.com/2011/08/25/68000-interleaved-memory-controller-design/
+                return true;
+            }
+            addr >= 0xE0_0000
+        };
 
         // VPA
-        if addr >= 0xE0_0000 {
+        if vpa {
             if !self.vpa_sync {
                 // Start E-Clock synchronization, wait for next low edge.
                 self.vpa_sync = true;
@@ -626,7 +729,9 @@ where
             return BusResult::WaitState;
         }
 
-        let val = if self.overlay {
+        let val = if self.model == MacModel::HugeSE {
+            self.read_born32(addr)
+        } else if self.overlay {
             self.read_overlay(addr)
         } else {
             self.read_normal(addr)
@@ -646,7 +751,9 @@ where
             return BusResult::WaitState;
         }
 
-        let written = if self.overlay {
+        let written = if self.model == MacModel::HugeSE {
+            self.write_born32(addr, val)
+        } else if self.overlay {
             self.write_overlay(addr, val)
         } else {
             self.write_normal(addr, val)
@@ -851,6 +958,16 @@ where
     TRenderer: Renderer,
 {
     fn inspect_read(&mut self, addr: Address) -> Option<Byte> {
+        if self.model == MacModel::HugeSE {
+            // born-32: RAM and ROM only; the debugger must never touch I/O
+            return match addr {
+                0x0000_0000..=0x00FF_FFFF => Some(self.ram[addr as usize & self.ram_mask]),
+                0x4080_0000..=0x4087_FFFF => {
+                    self.rom.get((addr - Self::B32_ROM_BASE) as usize).copied()
+                }
+                _ => None,
+            };
+        }
         // Everything up to 0x800000 is safe (RAM/ROM only)
         if addr >= 0x80_0000 {
             None
@@ -862,6 +979,13 @@ where
     }
 
     fn inspect_write(&mut self, addr: Address, val: Byte) -> Option<()> {
+        if self.model == MacModel::HugeSE {
+            // born-32: RAM only
+            return match addr {
+                0x0000_0000..=0x00FF_FFFF => self.write_born32(addr, val),
+                _ => None,
+            };
+        }
         // Everything up to 0x800000 is safe (RAM/ROM only)
         if addr >= 0x80_0000 {
             None
