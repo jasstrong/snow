@@ -279,6 +279,22 @@ pub struct SystrapHistoryEntry {
     pub pc: Address,
 }
 
+/// born-32: the answers PiStorm's Gestalt intercept (emulator.c:594-646) gives a
+/// hugeSE 68030, mirrored verbatim for parity -- including 'mach' = 6 (Mac II), which
+/// PiStorm returns because its bigSE test (ROM base >= $800000) also matches hugeSE.
+/// Other selectors go to the real Gestalt trap.
+const fn born32_gestalt(selector: u32) -> Option<u32> {
+    match selector {
+        0x7072_6F63 => Some(4),     // 'proc': 68030
+        0x6670_7520 => Some(3),     // 'fpu '
+        0x6D6D_7520 => Some(2),     // 'mmu ': 68030 PMMU
+        0x6164_6472 => Some(0x07),  // 'addr': 32-bit capable, 32-bit mode
+        0x6370_7574 => Some(0x103), // 'cput'
+        0x6D61_6368 => Some(6),     // 'mach'
+        _ => None,
+    }
+}
+
 /// Motorola 680x0
 #[derive(Serialize, Deserialize)]
 pub struct CpuM68k<
@@ -385,6 +401,43 @@ pub struct CpuM68k<
 
     /// NMI edge trigger level
     in_nmi: bool,
+
+    /// born-32 hugeSE: emulator-side behaviour the PiStorm hugeSE machine provides
+    /// (MemTop seam, swallowing the figment/boot32 debug A-traps). Set by the
+    /// emulator for the HugeSE model only.
+    #[serde(default)]
+    pub born32: bool,
+
+    /// Debug: stop (via the breakpoint latch) the first time the PC enters
+    /// [lo, hi). Cleared once it fires.
+    #[serde(skip)]
+    pub pc_trap: Option<(Address, Address)>,
+
+    /// Debug: log every CPU write into [lo, hi) (physical) with the PC, then continue.
+    #[serde(skip)]
+    pub write_watch: Option<(Address, Address)>,
+
+    /// Debug: with write_watch, latch the breakpoint on the Nth watched byte write
+    /// (0 = never stop).
+    #[serde(skip)]
+    pub write_watch_stop: u32,
+    #[serde(skip)]
+    pub write_watch_hits: u32,
+
+    /// born-32 Resource Manager hook state (PiStorm parity): the type and ID of the
+    /// GetResource call in flight, and whether a 'gtbl' has loaded (which arms
+    /// PATCH-RELOC and RESLOAD-FIX).
+    #[serde(skip)]
+    b32_rsrc_type: u32,
+    #[serde(skip)]
+    b32_rsrc_id: u16,
+    #[serde(skip)]
+    b32_gtbl_loaded: bool,
+    /// born-32 [GO32]: set once $0B73 has been cleared; then re-clamped every 64 steps
+    #[serde(skip)]
+    b32_go32: bool,
+    #[serde(skip)]
+    b32_go32_ctr: u32,
 }
 
 impl<
@@ -429,6 +482,16 @@ where
             icache_tags: [ICACHE_TAG_INVALID; ICACHE_LINES],
             restart_regs: None,
             in_nmi: false,
+            born32: false,
+            pc_trap: None,
+            write_watch: None,
+            write_watch_stop: 0,
+            write_watch_hits: 0,
+            b32_rsrc_type: 0,
+            b32_rsrc_id: 0,
+            b32_gtbl_loaded: false,
+            b32_go32: false,
+            b32_go32_ctr: 0,
         }
     }
 
@@ -534,7 +597,9 @@ where
     fn prefetch_pump_force(&mut self) -> Result<()> {
         let fetch_addr = self.regs.pc.wrapping_add(4) & ADDRESS_MASK;
 
-        let new_item = if CPU_TYPE >= M68020 && self.regs.cacr.e() {
+        // born-32: PiStorm's Musashi models no I-cache on a 68030 (m68kcpu.h:1129-1177),
+        // so bypass Snow's for parity (the SE ROM's CPU probe turns CACR.EI on).
+        let new_item = if CPU_TYPE >= M68020 && self.regs.cacr.e() && !self.born32 {
             if fetch_addr & 1 != 0 {
                 // Unaligned access through I-cache raises exception
                 bail!(CpuError::AddressError(Group0Details {
@@ -665,6 +730,157 @@ where
         Ok(())
     }
 
+    /// born-32: guest memory access for the PiStorm-parity hooks below. RAM/ROM
+    /// only (never I/O), where physical == logical on born-32.
+    fn b32_peek8(&mut self, addr: Address) -> u8 {
+        match crate::bus::Bus::read(&mut self.bus, addr) {
+            crate::bus::BusResult::Ok(v) => v,
+            _ => 0,
+        }
+    }
+
+    fn b32_peek16(&mut self, addr: Address) -> u16 {
+        u16::from_be_bytes([self.b32_peek8(addr), self.b32_peek8(addr.wrapping_add(1))])
+    }
+
+    fn b32_peek32(&mut self, addr: Address) -> u32 {
+        u32::from_be_bytes([
+            self.b32_peek8(addr),
+            self.b32_peek8(addr.wrapping_add(1)),
+            self.b32_peek8(addr.wrapping_add(2)),
+            self.b32_peek8(addr.wrapping_add(3)),
+        ])
+    }
+
+    fn b32_poke8(&mut self, addr: Address, val: u8) {
+        let _ = crate::bus::Bus::write(&mut self.bus, addr, val);
+    }
+
+    fn b32_poke32(&mut self, addr: Address, val: u32) {
+        for (i, b) in val.to_be_bytes().into_iter().enumerate() {
+            self.b32_poke8(addr.wrapping_add(i as Address), b);
+        }
+    }
+
+    /// born-32: the emulator-side behaviour PiStorm's hugeSE machine provides
+    /// (emulator.c), replicated for parity. Runs before the instruction at PC.
+    fn born32_hooks(&mut self) {
+        const PTCH_LC: u32 = u32::from_be_bytes(*b"ptch");
+        const PTCH_UC: u32 = u32::from_be_bytes(*b"PTCH");
+        const GTBL: u32 = u32::from_be_bytes(*b"gtbl");
+
+        // [GO32-RE] (emulator.c:1260): the loaded System may re-derive 24-bit mode; keep
+        // $0B73 bits 0/1 (Systemis24bit/Sysheapis24bit) clear, checked every 64 steps.
+        if self.b32_go32 {
+            self.b32_go32_ctr = self.b32_go32_ctr.wrapping_add(1);
+            if self.b32_go32_ctr & 0x3F == 0 {
+                let v = self.b32_peek8(0x0B73);
+                if v & 3 != 0 {
+                    self.b32_poke8(0x0B73, v & 0xFC);
+                    debug!("born-32 [GO32-RE] $0B73 ${v:02X} re-cleared");
+                }
+            }
+        }
+
+        match self.regs.pc {
+            // "$48 seam" (emulator.c:2726-2786): the patched ROM still loads a stale 8MB
+            // MemTop at $1CFE; PiStorm overrides it with the top of the 16MB map and moves
+            // the stack below the vidram carve (out of the sound buffer).
+            0x4080_0048 => {
+                self.regs.a[6] = 0x0100_0000;
+                *self.regs.ssp_mut() = 0x00FF_0000;
+            }
+            // [GO32] (emulator.c:1242): at InitRsrcMgr entry, clear $0B73 bits 0/1 so the
+            // System runs 32-bit instead of packing flags into pointer high bytes.
+            0x4080_07E8 if !self.b32_go32 => {
+                self.b32_go32 = true;
+                let v = self.b32_peek8(0x0B73);
+                self.b32_poke8(0x0B73, v & 0xFC);
+                info!("born-32 [GO32] $0B73 ${v:02X} -> ${:02X}", v & 0xFC);
+            }
+            // GetResource / Get1Resource entry: remember what is being asked for
+            0x4084_90DE | 0x4084_90D6 => {
+                let sp = self.regs.read_a::<Long>(7);
+                self.b32_rsrc_type = self.b32_peek32(sp.wrapping_add(6));
+                self.b32_rsrc_id = self.b32_peek16(sp.wrapping_add(4));
+                // [RESLOAD-FIX] (emulator.c:1493): our SuperMario RM returns NIL rather
+                // than an empty handle for GetResource with ResLoad=false, and the machine
+                // patch's existence checks need the real handle.
+                if self.b32_rsrc_type == PTCH_LC
+                    && self.b32_gtbl_loaded
+                    && self.b32_peek8(0x0A5E) == 0
+                {
+                    self.b32_poke8(0x0A5E, 1);
+                    info!(
+                        "born-32 [RESLOAD-FIX] ptch {}: ResLoad forced true",
+                        self.b32_rsrc_id as i16
+                    );
+                }
+            }
+            // Resource Manager exit (StdExitOut's RTS); the result handle is at SP+4
+            0x4084_9554 => {
+                let sp = self.regs.read_a::<Long>(7);
+                let hv = self.b32_peek32(sp.wrapping_add(4));
+                let h = hv & 0x01FF_FFFF;
+                let ty = std::mem::take(&mut self.b32_rsrc_type);
+                let id = self.b32_rsrc_id as i16;
+                if ty != 0 && std::env::var_os("SNOW_B32_RSRCLOG").is_some() {
+                    let p = if h != 0 { self.b32_peek32(h) & 0x01FF_FFFF } else { 0 };
+                    let tys = String::from_utf8_lossy(&ty.to_be_bytes()).into_owned();
+                    info!("born-32 [RSRC] '{tys}' {id} h=${h:08X} p=${p:08X}");
+                }
+                if ty != 0 && h != 0 {
+                    if ty == GTBL {
+                        self.b32_gtbl_loaded = true;
+                        info!("born-32: gtbl {id} loaded (PATCH-RELOC/RESLOAD-FIX armed)");
+                    }
+                    // [PATCH-RELOC] (emulator.c:1542): machine patches call the SE ROM by
+                    // absolute address at $004xxxxx (original SE) or $008xxxxx (bigSE);
+                    // relocate abs.L operands (opword & $3F == $39) to our ROM at $40800000.
+                    if self.b32_gtbl_loaded && (ty == PTCH_LC || ty == PTCH_UC) {
+                        let rp = self.b32_peek32(h) & 0x01FF_FFFF;
+                        let mut n = 0;
+                        let mut o: Address = 2;
+                        while o + 4 <= 0x1_0000 {
+                            let v = self.b32_peek32(rp.wrapping_add(o));
+                            let add = match v {
+                                0x0080_0000..=0x0087_FFFF => 0x4000_0000,
+                                0x0040_0000..=0x0047_FFFF => 0x4040_0000,
+                                _ => 0,
+                            };
+                            if add != 0 && self.b32_peek16(rp.wrapping_add(o - 2)) & 0x3F == 0x39 {
+                                self.b32_poke32(rp.wrapping_add(o), v + add);
+                                n += 1;
+                            }
+                            o += 2;
+                        }
+                        let tys = String::from_utf8_lossy(&ty.to_be_bytes()).into_owned();
+                        info!("born-32 [PATCH-RELOC] '{tys}' {id}: relocated {n} ROM refs");
+                    }
+                }
+                // [GUSD-RAM] (emulator.c:1503, content-keyed at every RM exit): force the
+                // startup method for machines 5 and 9 to $02 (SE, classic QuickDraw).
+                if (0x1000..0x01F0_0000).contains(&h) {
+                    let p = self.b32_peek32(h) & 0x01FF_FFFF;
+                    if (0x1000..0x01F0_0000).contains(&p)
+                        && self.b32_peek32(p) == 0x0001_AE5B
+                        && self.b32_peek32(p + 4) == 0x5E75_006D
+                    {
+                        let (m5, m9) = (self.b32_peek8(p + 0x0F), self.b32_peek8(p + 0x1F));
+                        if m5 != 0x02 || m9 != 0x02 {
+                            self.b32_poke8(p + 0x0F, 0x02);
+                            self.b32_poke8(p + 0x1F, 0x02);
+                            info!(
+                                "born-32 [GUSD-RAM] gusd @${p:08X}: methods ${m5:02X}/${m9:02X} -> $02/$02"
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Executes a single CPU step.
     pub fn step(&mut self) -> Result<()> {
         debug_assert_eq!(self.prefetch.len(), 2);
@@ -684,6 +900,21 @@ where
         // Flag exceptions before executing the instruction to act on them later
         let trace_exception = self.regs.sr.trace() && !self.trace_mask;
         let irq_exception = self.bus.get_irq();
+
+        if self.born32 {
+            self.born32_hooks();
+        }
+
+        if let Some((lo, hi)) = self.pc_trap
+            && (lo..hi).contains(&self.regs.pc)
+        {
+            info!(
+                "PC trap: PC ${:08X} entered [${:08X}, ${:08X})",
+                self.regs.pc, lo, hi
+            );
+            self.breakpoint_hit.set();
+            self.pc_trap = None;
+        }
 
         // Start of instruction execution
         if self.history_enabled {
@@ -1450,6 +1681,29 @@ where
             InstructionMnemonic::ROR_l => self.op_shrot::<Long>(instr, Self::alu_ror),
             InstructionMnemonic::ROL_ea => self.op_shrot_ea(instr, Self::alu_rol),
             InstructionMnemonic::ROR_ea => self.op_shrot_ea(instr, Self::alu_ror),
+            // born-32: PiStorm swallows the figment/boot32 debug A-traps ($A0FC-$A0FE)
+            // as NOPs; dispatching them would go through an OS trap table that does
+            // not exist yet at that point in the boot.
+            InstructionMnemonic::LINEA if self.born32 && matches!(instr.data, 0xA0FC..=0xA0FE) => {
+                self.advance_cycles(4)
+            }
+            // born-32: PiStorm's _SwapMMUMode intercept (m68kcpu.h): born-32 is always
+            // 32-bit; report the previous mode as 32-bit (D0 = 1) without dispatching.
+            InstructionMnemonic::LINEA if self.born32 && instr.data == 0xA05D => {
+                self.regs.d[0] = 1;
+                self.advance_cycles(4)
+            }
+            // born-32: PiStorm's Gestalt intercept answers these selectors itself
+            // (D0 = noErr, A0 = answer) instead of dispatching the trap.
+            InstructionMnemonic::LINEA
+                if self.born32
+                    && matches!(instr.data, 0xA1AD | 0xA0AD)
+                    && born32_gestalt(self.regs.d[0]).is_some() =>
+            {
+                self.regs.a[0] = born32_gestalt(self.regs.d[0]).unwrap_or_default();
+                self.regs.d[0] = 0;
+                self.advance_cycles(4)
+            }
             InstructionMnemonic::LINEA => {
                 if self.breakpoints.contains(&Breakpoint::LineA(instr.data)) {
                     info!(

@@ -352,6 +352,15 @@ where
                         self.advance_cycles(2)?;
                     }
 
+                    if let Some((lo, hi)) = self.write_watch
+                        && (lo..hi).contains(&byte_addr)
+                    {
+                        log::info!("[WATCH] write ${:02X} -> ${:08X} PC=${:08X}", b, byte_addr, self.regs.pc);
+                        self.write_watch_hits += 1;
+                        if self.write_watch_stop != 0 && self.write_watch_hits == self.write_watch_stop {
+                            self.breakpoint_hit.set();
+                        }
+                    }
                     // Trigger bus access breakpoints
                     if self.breakpoints.iter().any(|bp| {
                         *bp == Breakpoint::Bus(BusBreakpoint::Write, byte_addr)
@@ -425,6 +434,15 @@ where
                         self.advance_cycles(2)?;
                     }
 
+                    if let Some((lo, hi)) = self.write_watch
+                        && (lo..hi).contains(&byte_addr)
+                    {
+                        log::info!("[WATCH] write ${:02X} -> ${:08X} PC=${:08X}", b, byte_addr, self.regs.pc);
+                        self.write_watch_hits += 1;
+                        if self.write_watch_stop != 0 && self.write_watch_hits == self.write_watch_stop {
+                            self.breakpoint_hit.set();
+                        }
+                    }
                     // Trigger bus access breakpoints
                     if self.breakpoints.iter().any(|bp| {
                         *bp == Breakpoint::Bus(BusBreakpoint::Write, byte_addr)
