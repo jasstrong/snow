@@ -514,6 +514,17 @@ impl Emulator {
                 if let Some((lo, hi)) = cpu.pc_trap {
                     log::info!("born-32 PC trap armed: [${lo:08X}, ${hi:08X})");
                 }
+                // Debug: SNOW_B32_PCLOG=lo:hi[:max] (hex, max decimal) logs PC, SP and the top
+                // stack longs (return address, C args) each time the PC enters [lo, hi)
+                if let Ok(s) = std::env::var("SNOW_B32_PCLOG") {
+                    let mut it = s.split(':');
+                    let hex = |v: &str| Address::from_str_radix(v.trim_start_matches("0x"), 16).ok();
+                    if let (Some(lo), Some(hi)) = (it.next().and_then(hex), it.next().and_then(hex)) {
+                        cpu.pc_log = Some((lo, hi));
+                        cpu.pc_log_left = it.next().and_then(|m| m.parse().ok()).unwrap_or(2000);
+                        log::info!("born-32 PC log armed: [${lo:08X}, ${hi:08X}) x{}", cpu.pc_log_left);
+                    }
+                }
                 // Debug: SNOW_B32_WATCH=lo:hi (hex) logs every CPU write into [lo, hi)
                 cpu.write_watch = std::env::var("SNOW_B32_WATCH").ok().and_then(|s| {
                     let (lo, hi) = s.split_once(':')?;

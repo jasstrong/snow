@@ -412,6 +412,12 @@ pub struct CpuM68k<
     /// [lo, hi). Cleared once it fires.
     #[serde(skip)]
     pub pc_trap: Option<(Address, Address)>,
+    /// born-32 debug: log PC, SP and the top stack longs each time the PC enters [lo, hi)
+    #[serde(skip)]
+    pub pc_log: Option<(Address, Address)>,
+    /// born-32 debug: remaining [`Self::pc_log`] lines
+    #[serde(skip)]
+    pub pc_log_left: u32,
 
     /// Debug: log every CPU write into [lo, hi) (physical) with the PC, then continue.
     #[serde(skip)]
@@ -484,6 +490,8 @@ where
             in_nmi: false,
             born32: false,
             pc_trap: None,
+            pc_log: None,
+            pc_log_left: 0,
             write_watch: None,
             write_watch_stop: 0,
             write_watch_hits: 0,
@@ -929,6 +937,19 @@ where
             );
             self.breakpoint_hit.set();
             self.pc_trap = None;
+        }
+
+        if let Some((lo, hi)) = self.pc_log
+            && self.pc_log_left > 0
+            && (lo..hi).contains(&self.regs.pc)
+        {
+            self.pc_log_left -= 1;
+            let sp = self.regs.read_a::<Address>(7);
+            let (s0, s1, s2) = (self.b32_peek32(sp), self.b32_peek32(sp + 4), self.b32_peek32(sp + 8));
+            info!(
+                "PC log: PC ${:08X} SP ${:08X} [SP] ${:08X} ${:08X} ${:08X} A0 ${:08X} D0 ${:08X}",
+                self.regs.pc, sp, s0, s1, s2, self.regs.a[0], self.regs.d[0]
+            );
         }
 
         // Start of instruction execution
