@@ -56,6 +56,14 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     scsi_id: usize,
 
+    /// Attach an emulated DaynaPORT SCSI/Link Ethernet adapter (link down) at this SCSI ID
+    #[arg(long)]
+    ethernet_id: Option<usize>,
+
+    /// 256-byte PRAM file (RTC address order), loaded at start and kept updated
+    #[arg(long)]
+    pram: Option<PathBuf>,
+
     /// RAM size in megabytes (model default if omitted)
     #[arg(long)]
     ram_mb: Option<usize>,
@@ -320,6 +328,13 @@ fn main() -> Result<()> {
     if let Some(disk) = &args.scsi {
         emulator.load_hdd_image(disk, args.scsi_id)?;
         info!("SCSI {}: {}", args.scsi_id, disk.display());
+    }
+    if let Some(id) = args.ethernet_id {
+        emulator.attach_ethernet(id);
+    }
+    if let Some(pram) = &args.pram {
+        emulator.persist_pram(pram);
+        info!("PRAM: {}", pram.display());
     }
 
     let cmd = emulator.create_cmd_sender();
