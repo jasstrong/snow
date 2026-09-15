@@ -1741,6 +1741,30 @@ where
                 self.advance_cycles(4)
             }
             InstructionMnemonic::LINEA => {
+                // born-32 debug: SNOW_B32_TBHIJACK=1 mimics PiStorm's "SuperMario RM Toolbox trap
+                // fix" (m68kcpu.h): it indexes the $0E00 table with trap & $1FF (9 bits) and, when
+                // that handler is a ROM Resource Manager routine, pushes the post-trap PC
+                // (non-auto-pop traps) and jumps there. Used to show it misroutes $ABxx traps.
+                {
+                    static TBHIJACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if self.born32
+                        && instr.data & 0x0800 != 0
+                        && *TBHIJACK.get_or_init(|| std::env::var_os("SNOW_B32_TBHIJACK").is_some())
+                    {
+                        let handler =
+                            self.b32_peek32(0x0E00 + Address::from(instr.data & 0x01FF) * 4);
+                        if (0x4084_8000..0x4086_0000).contains(&handler) {
+                            let ret = self.regs.pc.wrapping_add(2) & ADDRESS_MASK;
+                            self.set_pc(handler)?;
+                            self.prefetch_pump()?;
+                            if instr.data & 0x0400 == 0 {
+                                let sp = self.regs.read_a_predec(7, 4);
+                                self.write_ticks(sp, ret)?;
+                            }
+                            return self.prefetch_refill();
+                        }
+                    }
+                }
                 if self.breakpoints.contains(&Breakpoint::LineA(instr.data)) {
                     info!(
                         "Breakpoint hit (LINEA): ${:04X}, PC: ${:08X}",
