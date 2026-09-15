@@ -829,6 +829,21 @@ where
                     let tys = String::from_utf8_lossy(&ty.to_be_bytes()).into_owned();
                     info!("born-32 [RSRC] '{tys}' {id} h=${h:08X} p=${p:08X}");
                 }
+                // SNOW_B32_RSRCDUMP=<dir>: write each 'lpch' as the RM returns it (raw, before
+                // the linked-patch loader touches it) to <dir>/lpch_<id>.bin
+                if ty == u32::from_be_bytes(*b"lpch") && h != 0 {
+                    if let Some(dir) = std::env::var_os("SNOW_B32_RSRCDUMP") {
+                        let p = self.b32_peek32(h) & 0x01FF_FFFF;
+                        if p != 0 {
+                            let size = self.b32_peek32(p.wrapping_sub(16).wrapping_add(8)) & 0x00FF_FFFF;
+                            let n = size.saturating_sub(16).min(0x10_0000);
+                            let bytes: Vec<u8> = (0..n).map(|i| self.b32_peek8(p.wrapping_add(i))).collect();
+                            let path = std::path::Path::new(&dir).join(format!("lpch_{id}.bin"));
+                            let _ = std::fs::write(&path, &bytes);
+                            info!("born-32 [RSRCDUMP] 'lpch' {id}: {n} bytes -> {}", path.display());
+                        }
+                    }
+                }
                 if ty != 0 && h != 0 {
                     if ty == GTBL {
                         self.b32_gtbl_loaded = true;
