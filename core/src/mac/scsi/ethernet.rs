@@ -827,6 +827,9 @@ impl ScsiTarget for ScsiTargetEthernet {
 
                 let Some(rx) = self.rx.as_ref() else {
                     // Link down
+                    if let Some(frame) = synthetic_rx_frame(read_len) {
+                        return Ok(ScsiCmdResult::DataIn(frame));
+                    }
                     return Ok(ScsiCmdResult::DataIn(vec![0; 6]));
                 };
 
@@ -1058,6 +1061,42 @@ impl ScsiTarget for ScsiTargetEthernet {
     fn eth_capture_status(&self) -> Option<EthernetCaptureStatus> {
         self.get_capture_status()
     }
+}
+
+/// Debug: SNOW_ETH_RX_NOISE=N makes every Nth READ(6) on a link-down adapter return one
+/// synthetic broadcast ARP request (in the DaynaPORT READ(6) format), so the guest driver's
+/// receive path runs the way it does on a live LAN.
+fn synthetic_rx_frame(read_len: usize) -> Option<Vec<u8>> {
+    use std::sync::OnceLock;
+    use std::sync::atomic::Ordering;
+    static EVERY: OnceLock<usize> = OnceLock::new();
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    const FCS: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("SNOW_ETH_RX_NOISE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    });
+    if every == 0 || POLLS.fetch_add(1, Ordering::Relaxed) % every != every - 1 {
+        return None;
+    }
+    let src = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let mut packet = vec![0xFF; 6];
+    packet.extend(src);
+    packet.extend([0x08, 0x06, 0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]);
+    packet.extend(src);
+    packet.extend([192, 168, 1, 2, 0, 0, 0, 0, 0, 0, 192, 168, 1, 1]);
+    packet.resize(64, 0);
+    let frame_len = packet.len() + 4;
+    if read_len < 6 + frame_len {
+        return None;
+    }
+    let mut response = vec![(frame_len >> 8) as u8, frame_len as u8, 0, 0, 0, 0];
+    response.extend(&packet);
+    response.extend(FCS.checksum(&packet).to_be_bytes());
+    Some(response)
 }
 
 impl Debuggable for ScsiTargetEthernet {
