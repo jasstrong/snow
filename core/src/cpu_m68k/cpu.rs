@@ -418,6 +418,14 @@ pub struct CpuM68k<
     /// born-32 debug: remaining [`Self::pc_log`] lines
     #[serde(skip)]
     pub pc_log_left: u32,
+    /// born-32 debug: SP offsets whose stack long is followed as a pointer on each
+    /// [`Self::pc_log`] line (16 bytes logged at it)
+    #[serde(skip)]
+    pub pc_log_deref: Vec<Address>,
+    /// born-32 debug: also log the current QuickDraw port (A5 -> QD globals -> thePort)
+    /// and its first 16 bytes on each [`Self::pc_log`] line
+    #[serde(skip)]
+    pub pc_log_qd: bool,
 
     /// Debug: log every CPU write into [lo, hi) (physical) with the PC, then continue.
     #[serde(skip)]
@@ -492,6 +500,8 @@ where
             pc_trap: None,
             pc_log: None,
             pc_log_left: 0,
+            pc_log_deref: Vec::new(),
+            pc_log_qd: false,
             write_watch: None,
             write_watch_stop: 0,
             write_watch_hits: 0,
@@ -945,10 +955,44 @@ where
         {
             self.pc_log_left -= 1;
             let sp = self.regs.read_a::<Address>(7);
-            let (s0, s1, s2) = (self.b32_peek32(sp), self.b32_peek32(sp + 4), self.b32_peek32(sp + 8));
+            // 8 longs: enough for a Toolbox trap's whole Pascal frame (e.g. CopyBits' 22 bytes)
+            let stack: Vec<String> = (0..8u32)
+                .map(|i| format!("${:08X}", self.b32_peek32(sp + 4 * i)))
+                .collect();
+            // SNOW_B32_PCLOG_DEREF: follow stack longs as pointers (call-time struct contents)
+            let deref: Vec<String> = self
+                .pc_log_deref
+                .clone()
+                .into_iter()
+                .map(|off| {
+                    let p = self.b32_peek32(sp + off);
+                    let words: Vec<String> =
+                        (0..4u32).map(|i| format!("{:08X}", self.b32_peek32(p + 4 * i))).collect();
+                    format!(" *[SP+{off:X}]=${p:08X}: {}", words.join(" "))
+                })
+                .collect();
+            // SNOW_B32_PCLOG_QD: the port QuickDraw will draw into, and its BitMap
+            let qd = if self.pc_log_qd {
+                let a5 = self.regs.a[5];
+                let qd_globals = self.b32_peek32(a5);
+                let port = self.b32_peek32(qd_globals);
+                let w: Vec<String> =
+                    (0..4u32).map(|i| format!("{:08X}", self.b32_peek32(port + 4 * i))).collect();
+                format!(" thePort=${port:08X}: {}", w.join(" "))
+            } else {
+                String::new()
+            };
             info!(
-                "PC log: PC ${:08X} SP ${:08X} [SP] ${:08X} ${:08X} ${:08X} A0 ${:08X} D0 ${:08X}",
-                self.regs.pc, sp, s0, s1, s2, self.regs.a[0], self.regs.d[0]
+                "PC log: PC ${:08X} SP ${:08X} [SP] {} A0 ${:08X} A4 ${:08X} A5 ${:08X} D0 ${:08X}{}{}",
+                self.regs.pc,
+                sp,
+                stack.join(" "),
+                self.regs.a[0],
+                self.regs.a[4],
+                self.regs.a[5],
+                self.regs.d[0],
+                deref.concat(),
+                qd
             );
         }
 

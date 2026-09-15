@@ -525,6 +525,18 @@ impl Emulator {
                         log::info!("born-32 PC log armed: [${lo:08X}, ${hi:08X}) x{}", cpu.pc_log_left);
                     }
                 }
+                // Debug: SNOW_B32_PCLOG_DEREF=off[,off...] (hex SP offsets): on each PC log line,
+                // follow those stack longs as pointers and log 16 bytes at each
+                if let Ok(s) = std::env::var("SNOW_B32_PCLOG_DEREF") {
+                    cpu.pc_log_deref = s
+                        .split(',')
+                        .filter_map(|v| Address::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+                        .collect();
+                    log::info!("born-32 PC log deref at SP offsets {:X?}", cpu.pc_log_deref);
+                }
+                // Debug: SNOW_B32_PCLOG_QD (any value): on each PC log line, also log the current
+                // QuickDraw port (A5 -> QD globals -> thePort) and its first 16 bytes
+                cpu.pc_log_qd = std::env::var("SNOW_B32_PCLOG_QD").is_ok();
                 // Debug: SNOW_B32_WATCH=lo:hi (hex) logs every CPU write into [lo, hi)
                 cpu.write_watch = std::env::var("SNOW_B32_WATCH").ok().and_then(|s| {
                     let (lo, hi) = s.split_once(':')?;
