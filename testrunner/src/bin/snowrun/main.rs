@@ -90,6 +90,13 @@ struct Args {
     #[arg(long = "key", value_name = "SECS:KEY[:HOLD]")]
     keys: Vec<String>,
 
+    /// Scripted mouse click "SECS:X:Y[:HOLD]", repeatable: the pointer moves to screen
+    /// (X, Y) half a second before SECS, the button goes down at SECS and up HOLD
+    /// seconds later (default 1). Uses the absolute mouse mode (writes the OS's mouse
+    /// globals); without any --mouse the mouse stays disabled.
+    #[arg(long = "mouse", value_name = "SECS:X:Y[:HOLD]")]
+    mouse: Vec<String>,
+
     /// Write guest RAM at the end of the run to this file. Built from the core's
     /// dirty-page snapshots, so it is as current as the last status update.
     #[arg(long)]
@@ -163,6 +170,30 @@ fn parse_key(spec: &str) -> Result<(f64, u8, f64)> {
         None => 0.1,
     };
     Ok((secs, code, hold))
+}
+
+/// A scripted mouse action.
+#[derive(Clone, Copy)]
+enum MouseAct {
+    Move(u16, u16),
+    Down,
+    Up,
+}
+
+/// Parses "SECS:X:Y[:HOLD]" into (press time, x, y, hold time).
+fn parse_mouse(spec: &str) -> Result<(f64, u16, u16, f64)> {
+    let p: Vec<&str> = spec.split(':').collect();
+    if p.len() < 3 {
+        anyhow::bail!("--mouse '{spec}': expected SECS:X:Y[:HOLD]");
+    }
+    let secs: f64 = p[0].parse().with_context(|| format!("--mouse '{spec}': bad SECS"))?;
+    let x: u16 = p[1].parse().with_context(|| format!("--mouse '{spec}': bad X"))?;
+    let y: u16 = p[2].parse().with_context(|| format!("--mouse '{spec}': bad Y"))?;
+    let hold: f64 = match p.get(3) {
+        Some(h) => h.parse().with_context(|| format!("--mouse '{spec}': bad HOLD"))?,
+        None => 1.0,
+    };
+    Ok((secs, x, y, hold))
 }
 
 /// Drains pending emulator events into `obs`. Returns true if the emulator
@@ -311,6 +342,22 @@ fn main() -> Result<()> {
     key_script.sort_by_key(|e| e.0);
     let mut key_script = key_script.into_iter().peekable();
 
+    // Mouse script: (tick, action), sorted by time.
+    let mut mouse_script: Vec<(Ticks, MouseAct)> = Vec::new();
+    for spec in &args.mouse {
+        let (secs, x, y, hold) = parse_mouse(spec)?;
+        mouse_script.push((((secs - 0.5).max(0.0) * SE_CLOCK_HZ) as Ticks, MouseAct::Move(x, y)));
+        mouse_script.push(((secs * SE_CLOCK_HZ) as Ticks, MouseAct::Down));
+        mouse_script.push((((secs + hold) * SE_CLOCK_HZ) as Ticks, MouseAct::Up));
+    }
+    mouse_script.sort_by_key(|e| e.0);
+    let mouse_mode = if mouse_script.is_empty() {
+        MouseMode::Disabled
+    } else {
+        MouseMode::Absolute
+    };
+    let mut mouse_script = mouse_script.into_iter().peekable();
+
     fs::create_dir_all(&args.out_dir)?;
 
     let (mut emulator, frame_recv) = Emulator::new_with_extra(
@@ -318,7 +365,7 @@ fn main() -> Result<()> {
         &[],
         model,
         None,
-        MouseMode::Disabled,
+        mouse_mode,
         args.ram_mb.map(|mb| mb * 1024 * 1024),
         None,
         args.pmmu,
@@ -391,6 +438,24 @@ fn main() -> Result<()> {
                 KeyEvent::KeyUp(code, Keymap::Universal)
             };
             cmd.send(EmulatorCommand::KeyEvent(ev))?;
+        }
+        while let Some((t, act)) = mouse_script.next_if(|e| e.0 <= now) {
+            let secs = t as f64 / SE_CLOCK_HZ;
+            match act {
+                MouseAct::Move(x, y) => {
+                    info!("t={secs:.2}s mouse to ({x}, {y})");
+                    cmd.send(EmulatorCommand::MouseUpdateAbsolute { x, y })?;
+                }
+                MouseAct::Down | MouseAct::Up => {
+                    let down = matches!(act, MouseAct::Down);
+                    info!("t={secs:.2}s mouse {}", if down { "down" } else { "up" });
+                    cmd.send(EmulatorCommand::MouseUpdateRelative {
+                        relx: 0,
+                        rely: 0,
+                        btn: Some(down),
+                    })?;
+                }
+            }
         }
 
         emulator.tick(1, ())?;
