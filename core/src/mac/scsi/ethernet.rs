@@ -1063,9 +1063,9 @@ impl ScsiTarget for ScsiTargetEthernet {
 impl Debuggable for ScsiTargetEthernet {
     fn get_debug_properties(&self) -> DebuggableProperties {
         use crate::debuggable::*;
-        use crate::{dbgprop_bool, dbgprop_string, dbgprop_udec};
+        use crate::{dbgprop_bool, dbgprop_group, dbgprop_string, dbgprop_udec};
         #[cfg(feature = "ethernet_nat")]
-        use crate::{dbgprop_group, dbgprop_str};
+        use crate::dbgprop_str;
 
         let mut result = vec![
             dbgprop_string!(
